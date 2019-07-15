@@ -164,19 +164,19 @@ func pushFile(jsonFile, fileName string) {
 	if err != nil {
 		log.Fatalf("Error: %v", err)
 	}
-	fmt.Printf("%s, %s, %s\n", res.Name, res.Id, res.MimeType)
+	fmt.Printf("%s, https://drive.google.com/open?id=%s, %s\n", res.Name, res.Id, res.MimeType)
 
-	/*permissiondata := &drive.Permission{
-		Type:               "domain",
-		Role:               "writer",
-		Domain:             "ebay.com",
+	permissiondata := &drive.Permission{
+		Type: "anyone",
+		Role: "reader",
+		//Domain:             "ebay.com",
 		AllowFileDiscovery: true,
 	}
 	pres, err := srv.Permissions.Create(res.Id, permissiondata).Do()
 	if err != nil {
 		log.Fatalf("Error: %v", err)
 	}
-	fmt.Printf("%s, %s\n", pres.Type, pres.Role)*/
+	fmt.Printf("%s, %s\n", pres.Type, pres.Role)
 
 }
 
@@ -210,8 +210,8 @@ func main() {
 	}
 	defer webcam.Close()
 
-	window := gocv.NewWindow("DNN Detection")
-	defer window.Close()
+	/*window := gocv.NewWindow("DNN Detection")
+	defer window.Close()*/
 
 	img := gocv.NewMat()
 	defer img.Close()
@@ -229,7 +229,7 @@ func main() {
 	var ratio float64
 	var mean gocv.Scalar
 	var swapRGB bool
-	var LastCropTime = time.Now()
+	var LastCropTime time.Time
 
 	if filepath.Ext(model) == ".caffemodel" {
 		ratio = 1.0
@@ -265,15 +265,16 @@ func main() {
 		// run a forward pass thru the network
 		prob := net.Forward("")
 
-		cropImg := performDetection(&img, prob)
+		/*cropImg :=*/
+		performDetection(&img, prob)
 
 		prob.Close()
 		blob.Close()
 
 		buf, _ := gocv.IMEncode(".jpg", img)
 		stream.UpdateJPEG(buf)
-		if cropImg &&
-			time.Now().Sub(LastCropTime).Seconds() > 15*time.Second.Seconds() {
+		if /*cropImg &&*/
+		time.Now().Sub(LastCropTime).Seconds() > 15*time.Second.Seconds() {
 
 			go func(img gocv.Mat) {
 
@@ -284,10 +285,10 @@ func main() {
 			LastCropTime = time.Now()
 		}
 
-		window.IMShow(img)
+		/*window.IMShow(img)
 		if window.WaitKey(1) >= 0 {
 			break
-		}
+		}*/
 	}
 }
 
