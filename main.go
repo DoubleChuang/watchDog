@@ -29,6 +29,7 @@
 package main
 
 import (
+	"container/list"
 	"encoding/json"
 	"fmt"
 	"image"
@@ -37,6 +38,8 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strconv"
+	"sync"
 	"time"
 
 	"net/http"
@@ -44,7 +47,8 @@ import (
 
 	"gocv.io/x/gocv"
 
-	"github.com/hybridgroup/mjpeg"
+	//"github.com/hybridgroup/mjpeg"
+	//"github.com/golang-collections/collections/stack"
 	"golang.org/x/net/context"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
@@ -121,11 +125,12 @@ func GetFileContentType(out *os.File) (string, error) {
 	// Use the net/http package's handy DectectContentType function. Always returns a valid
 	// content-type by returning "application/octet-stream" if no others seemed to match.
 	contentType := http.DetectContentType(buffer)
+	out.Seek(0, os.SEEK_SET)
 
 	return contentType, nil
 }
 func pushFile(jsonFile, fileName string) {
-	b, err := ioutil.ReadFile("credentials.json")
+	b, err := ioutil.ReadFile(jsonFile)
 	if err != nil {
 		log.Fatalf("Unable to read client secret file: %v", err)
 	}
@@ -147,18 +152,18 @@ func pushFile(jsonFile, fileName string) {
 		log.Fatalf("Error: %v", err)
 	}
 	defer file.Close()
+	//var convertedMimeType string
 
-	convertedMimeType := "application/vnd.google.drive.ext-type.jpg" // mimeType of file you want to convert on Google Drive https://developers.google.com/drive/api/v3/mime-types
-	baseMimeType := "image/jpeg"
-	/*baseMimeType, err := GetFileContentType(file)                    // mimeType of file you want to upload
+	//convertedMimeType := "application/vnd.google.drive.ext-type.jpg" // mimeType of file you want to convert on Google Drive https://developers.google.com/drive/api/v3/mime-types
+	baseMimeType, err := GetFileContentType(file) // mimeType of file you want to upload
 	fmt.Println(baseMimeType)
 	if err != nil {
 		baseMimeType = "image/jpg"
 		log.Fatalf("Error: %v", err)
-	}*/
+	}
 	f := &drive.File{
-		Name:     filepath.Base(fileName),
-		MimeType: convertedMimeType,
+		Name: filepath.Base(fileName),
+		//MimeType: convertedMimeType,
 	}
 	res, err := srv.Files.Create(f).Media(file, googleapi.ContentType(baseMimeType)).Do()
 	if err != nil {
@@ -180,11 +185,44 @@ func pushFile(jsonFile, fileName string) {
 
 }
 
-var stream *mjpeg.Stream
+type record struct {
+	lock  sync.Mutex
+	frame *list.List
+}
 
+func (r *record) Len() int {
+	//r.lock.Lock()
+	l := r.frame.Len()
+	//r.lock.Unlock()
+	return l
+}
+func (r *record) PopFront() interface{} {
+	//r.lock.Lock()
+	v := r.frame.Remove(r.frame.Front())
+	//r.lock.Unlock()
+	return v
+}
+func (r *record) PushBack(v interface{}) {
+
+	//r.lock.Lock()
+	r.frame.PushBack(v)
+
+	//r.lock.Unlock()
+	return
+}
+
+//var stream *mjpeg.Stream
+func isOpenWindow(val string) bool {
+	if v, err := strconv.ParseInt(val, 10, 64); err == nil {
+		if v > 0 {
+			return true
+		}
+	}
+	return false
+}
 func main() {
 	if len(os.Args) < 4 {
-		fmt.Println("How to run:\ndnn-detection [videosource] [modelfile] [configfile] ([backend] [device])")
+		fmt.Println("How to run:\ndnn-detection [videosource] [modelfile] [configfile] [show window]([backend] [device])")
 		return
 	}
 
@@ -192,26 +230,31 @@ func main() {
 	deviceID := os.Args[1]
 	model := os.Args[2]
 	config := os.Args[3]
+	OPENWINDOW := isOpenWindow(os.Args[4])
 	backend := gocv.NetBackendDefault
-	if len(os.Args) > 4 {
+	//fps := 25
+	if len(os.Args) > 5 {
 		backend = gocv.ParseNetBackend(os.Args[4])
 	}
 
 	target := gocv.NetTargetCPU
-	if len(os.Args) > 5 {
+	if len(os.Args) > 6 {
 		target = gocv.ParseNetTarget(os.Args[5])
 	}
 
 	// open capture device
 	webcam, err := gocv.OpenVideoCapture(deviceID)
+	//webcam, err := gocv.VideoCaptureFile(deviceID)
 	if err != nil {
 		fmt.Printf("Error opening video capture device: %v\n", deviceID)
 		return
 	}
+	var window *gocv.Window
 	defer webcam.Close()
-
-	/*window := gocv.NewWindow("DNN Detection")
-	defer window.Close()*/
+	if OPENWINDOW {
+		window = gocv.NewWindow("DNN Detection")
+		defer window.Close()
+	}
 
 	img := gocv.NewMat()
 	defer img.Close()
@@ -230,6 +273,17 @@ func main() {
 	var mean gocv.Scalar
 	var swapRGB bool
 	var LastCropTime time.Time
+	wg := sync.WaitGroup{}
+	fps := 30
+
+	var recordManager [3]record
+	for i, _ := range recordManager {
+		recordManager[i].frame = list.New()
+	}
+	var lastTime = time.Now()
+	var j int
+	var postAlarm bool
+	var postAlarmCnt int
 
 	if filepath.Ext(model) == ".caffemodel" {
 		ratio = 1.0
@@ -240,12 +294,12 @@ func main() {
 		mean = gocv.NewScalar(127.5, 127.5, 127.5, 0)
 		swapRGB = true
 	}
-	stream = mjpeg.NewStream()
+	/*stream = mjpeg.NewStream()
 	fmt.Printf("Start reading device: %v\n", deviceID)
 	go func() {
 		http.Handle("/", stream)
 		log.Fatal(http.ListenAndServe("0.0.0.0:8080", nil))
-	}()
+	}()*/
 
 	for {
 		if ok := webcam.Read(&img); !ok {
@@ -265,30 +319,81 @@ func main() {
 		// run a forward pass thru the network
 		prob := net.Forward("")
 
-		/*cropImg :=*/
-		performDetection(&img, prob)
+		cropImg := performDetection(&img, prob)
 
 		prob.Close()
 		blob.Close()
 
-		buf, _ := gocv.IMEncode(".jpg", img)
-		stream.UpdateJPEG(buf)
-		if /*cropImg &&*/
-		time.Now().Sub(LastCropTime).Seconds() > 15*time.Second.Seconds() {
+		//buf, _ := gocv.IMEncode(".jpg", img)
+		//stream.UpdateJPEG(buf)
+		if cropImg &&
+			time.Now().Sub(LastCropTime).Seconds() > 15*time.Second.Seconds() {
 
 			go func(img gocv.Mat) {
 
-				fileName := fmt.Sprintf("%s.jpg", time.Now().Format("2006_01_02_03_04_05"))
-				gocv.IMWrite(fileName, img)
-				pushFile("credentials.json", fileName)
+				fileName := fmt.Sprintf("%s.jpg", time.Now().Format("2006_01_02_15_04_05"))
+				if gocv.IMWrite(fileName, img) {
+					pushFile("credentials.json", fileName)
+				} else {
+					fmt.Println("IMWrite Fail")
+				}
 			}(img)
 			LastCropTime = time.Now()
 		}
 
-		/*window.IMShow(img)
-		if window.WaitKey(1) >= 0 {
-			break
-		}*/
+		if recordManager[j].Len() >= 5*fps && !postAlarm {
+			recordManager[j].PopFront()
+		} else if postAlarm && postAlarmCnt >= 5*fps {
+			postAlarmCnt = 0
+			postAlarm = false
+			lastTime = time.Now()
+			fmt.Println(recordManager[j].Len())
+			wg.Add(1)
+			go func(wg *sync.WaitGroup, r *record) {
+				defer wg.Done()
+
+				vName := fmt.Sprintf("%s.avi", time.Now().Format("2006_01_02_15_04_05"))
+
+				writer, err := gocv.VideoWriterFile(vName, "DIVX", float64(fps), img.Cols(), img.Rows(), true)
+				if err != nil {
+					fmt.Println("error opening video writer device")
+					return
+				}
+				//defer writer.Close()
+
+				for r.Len() > 0 {
+					e := r.PopFront()
+					if frame, ok := e.(gocv.Mat); ok {
+						if err := writer.Write(frame); err != nil {
+							fmt.Println(err)
+						}
+						time.Sleep(time.Duration(1000/fps) * time.Millisecond)
+					} else {
+						fmt.Println("Fail Mat")
+					}
+				}
+				writer.Close()
+				pushFile("credentials.json", vName)
+			}(&wg, &recordManager[j])
+
+			j++
+			j = j % 3
+
+		} else if postAlarm {
+			postAlarmCnt++
+		}
+
+		recordManager[j].PushBack(img)
+		if !postAlarm && time.Now().Sub(lastTime).Seconds() > 10*time.Second.Seconds() && cropImg {
+			fmt.Println(time.Now().Format("2006-01-02-15-04-05"))
+			postAlarm = true
+		}
+		if OPENWINDOW {
+			window.IMShow(img)
+			if window.WaitKey(1) >= 0 {
+				break
+			}
+		}
 	}
 }
 
@@ -301,7 +406,7 @@ func performDetection(frame *gocv.Mat, results gocv.Mat) (get bool) {
 
 	for i := 0; i < results.Total(); i += 7 {
 		confidence := results.GetFloatAt(0, i+2)
-		if confidence > 0.2 {
+		if confidence > 0.5 {
 			left := int(results.GetFloatAt(0, i+3) * float32(frame.Cols()))
 			top := int(results.GetFloatAt(0, i+4) * float32(frame.Rows()))
 			right := int(results.GetFloatAt(0, i+5) * float32(frame.Cols()))
