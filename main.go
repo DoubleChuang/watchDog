@@ -185,30 +185,162 @@ func pushFile(jsonFile, fileName string) {
 
 }
 
+type frameInfo struct {
+	mat       gocv.Mat
+	frameTime time.Time
+}
+
 type record struct {
 	lock  sync.Mutex
 	frame *list.List
 }
 
 func (r *record) Len() int {
-	//r.lock.Lock()
+	r.lock.Lock()
 	l := r.frame.Len()
-	//r.lock.Unlock()
+	r.lock.Unlock()
 	return l
 }
 func (r *record) PopFront() interface{} {
-	//r.lock.Lock()
-	v := r.frame.Remove(r.frame.Front())
-	//r.lock.Unlock()
-	return v
+	r.lock.Lock()
+	e := r.frame.Remove(r.frame.Front())
+	r.lock.Unlock()
+	return e
 }
-func (r *record) PushBack(v interface{}) {
 
-	//r.lock.Lock()
-	r.frame.PushBack(v)
+func (r *record) Front() interface{} {
+	r.lock.Lock()
+	e := r.frame.Front()
+	r.lock.Unlock()
+	return e
+}
+func (r *record) PushBack(v interface{}) *list.Element {
+	r.lock.Lock()
+	e := r.frame.PushBack(v)
+	r.lock.Unlock()
+	return e
+}
+func (r *record) PushFront(v interface{}) *list.Element {
+	r.lock.Lock()
+	e := r.frame.PushFront(v)
+	r.lock.Unlock()
+	return e
+}
+func checkListFrameTime(r *record, getFrame chan bool) {
 
-	//r.lock.Unlock()
-	return
+	for {
+		select {
+		//有新的影像儲存時 檢查Buffer頭一張是否超過時間
+		case <-getFrame:
+			if frame, ok := r.Front().(frameInfo); ok {
+				if time.Now().Sub(frame.frameTime) > 10*time.Second {
+					r.PopFront()
+				}
+			}
+
+		}
+	}
+}
+func frameDetecter(net *gocv.Net, scaleFactor float64, size image.Point, mean gocv.Scalar,
+	swapRB bool, crop bool, needDetect chan *list.Element, alarmChan chan *list.Element) {
+
+	for {
+		select {
+		case e := <-needDetect:
+			frame := e.Value.(frameInfo)
+			// convert image Mat to 300x300 blob that the object detector can analyze
+			blob := gocv.BlobFromImage(frame.mat, scaleFactor, image.Pt(300, 300), mean, swapRB, false)
+
+			// feed the blob into the detector
+			net.SetInput(blob, "")
+
+			// run a forward pass thru the network
+			prob := net.Forward("")
+
+			if performDetection(&frame.mat, prob) {
+				alarmChan <- e
+			}
+
+			prob.Close()
+			blob.Close()
+		}
+	}
+}
+
+var fps = 30
+
+func sendVideo(r *list.List, t time.Time) {
+	//defer wg.Done()
+	fileName := fmt.Sprintf("%s.avi", t.Format("2006_01_02_15_04_05"))
+	img := r.Front().Value.(frameInfo).mat
+	writer, err := gocv.VideoWriterFile(fileName, "DIVX", float64(fps), img.Cols(), img.Rows(), true)
+	if err != nil {
+		fmt.Println("error opening video writer device")
+		return
+	}
+	defer os.Remove(fileName)
+	//defer writer.Close()
+
+	for r.Len() > 0 {
+		e := r.Remove(r.Front())
+		if frame, ok := e.(frameInfo); ok {
+			if err := writer.Write(frame.mat); err != nil {
+				fmt.Println(err)
+			}
+			//time.Sleep(time.Duration(1000/fps) * time.Millisecond)
+		} else {
+			fmt.Println("Fail Mat")
+		}
+	}
+	writer.Close()
+	pushFile("credentials.json", fileName)
+}
+
+func sendJpeg(img gocv.Mat, t time.Time) {
+
+	fileName := fmt.Sprintf("%s.jpg", t.Format("2006_01_02_15_04_05"))
+
+	if gocv.IMWrite(fileName, img) {
+		defer os.Remove(fileName)
+		pushFile("credentials.json", fileName)
+	} else {
+		fmt.Println("IMWrite Fail")
+	}
+
+}
+func uploadMedia(alarmChan chan *list.Element) {
+	var lastUploadTime time.Time
+	for {
+		select {
+		case e := <-alarmChan:
+			if time.Now().Sub(lastUploadTime) >= 10*time.Second {
+				frameBuf := list.New()
+				alarmTime := e.Value.(frameInfo).frameTime
+
+				go sendJpeg(e.Value.(frameInfo).mat, alarmTime)
+
+				e_bk := e
+				for ; e != nil; e = e.Prev() {
+					frame := e.Value.(frameInfo)
+					if alarmTime.Sub(frame.frameTime) < 5*time.Second {
+						frameBuf.PushFront(frame)
+					} else {
+						break
+					}
+				}
+				for e := e_bk.Next(); e != nil; e = e.Next() {
+					frame := e.Value.(frameInfo)
+					if frame.frameTime.Sub(alarmTime) < 5*time.Second {
+						frameBuf.PushBack(frame)
+					} else {
+						break
+					}
+				}
+				go sendVideo(frameBuf, alarmTime)
+				lastUploadTime = time.Now()
+			}
+		}
+	}
 }
 
 //var stream *mjpeg.Stream
@@ -232,7 +364,10 @@ func main() {
 	config := os.Args[3]
 	OPENWINDOW := isOpenWindow(os.Args[4])
 	backend := gocv.NetBackendDefault
-	//fps := 25
+	alarmChan := make(chan *list.Element, 10*fps)
+	getFrameChan := make(chan bool, 20*fps)
+	needDetectChan := make(chan *list.Element, 30*fps)
+
 	if len(os.Args) > 5 {
 		backend = gocv.ParseNetBackend(os.Args[4])
 	}
@@ -272,18 +407,13 @@ func main() {
 	var ratio float64
 	var mean gocv.Scalar
 	var swapRGB bool
-	var LastCropTime time.Time
-	wg := sync.WaitGroup{}
-	fps := 30
+
+	//wg := sync.WaitGroup{}
 
 	var recordManager [3]record
 	for i, _ := range recordManager {
 		recordManager[i].frame = list.New()
 	}
-	var lastTime = time.Now()
-	var j int
-	var postAlarm bool
-	var postAlarmCnt int
 
 	if filepath.Ext(model) == ".caffemodel" {
 		ratio = 1.0
@@ -300,7 +430,9 @@ func main() {
 		http.Handle("/", stream)
 		log.Fatal(http.ListenAndServe("0.0.0.0:8080", nil))
 	}()*/
-
+	go checkListFrameTime(&recordManager[0], getFrameChan)
+	go frameDetecter(&net, ratio, image.Pt(300, 300), mean, swapRGB, false, needDetectChan, alarmChan)
+	go uploadMedia(alarmChan)
 	for {
 		if ok := webcam.Read(&img); !ok {
 			fmt.Printf("Device closed: %v\n", deviceID)
@@ -310,84 +442,12 @@ func main() {
 			continue
 		}
 
-		// convert image Mat to 300x300 blob that the object detector can analyze
-		blob := gocv.BlobFromImage(img, ratio, image.Pt(300, 300), mean, swapRGB, false)
-
-		// feed the blob into the detector
-		net.SetInput(blob, "")
-
-		// run a forward pass thru the network
-		prob := net.Forward("")
-
-		cropImg := performDetection(&img, prob)
-
-		prob.Close()
-		blob.Close()
-
+		e := recordManager[0].PushBack(frameInfo{img, time.Now()})
+		getFrameChan <- true
+		needDetectChan <- e
 		//buf, _ := gocv.IMEncode(".jpg", img)
 		//stream.UpdateJPEG(buf)
-		if cropImg &&
-			time.Now().Sub(LastCropTime).Seconds() > 15*time.Second.Seconds() {
 
-			go func(img gocv.Mat) {
-
-				fileName := fmt.Sprintf("%s.jpg", time.Now().Format("2006_01_02_15_04_05"))
-				if gocv.IMWrite(fileName, img) {
-					pushFile("credentials.json", fileName)
-				} else {
-					fmt.Println("IMWrite Fail")
-				}
-			}(img)
-			LastCropTime = time.Now()
-		}
-
-		if recordManager[j].Len() >= 5*fps && !postAlarm {
-			recordManager[j].PopFront()
-		} else if postAlarm && postAlarmCnt >= 5*fps {
-			postAlarmCnt = 0
-			postAlarm = false
-			lastTime = time.Now()
-			fmt.Println(recordManager[j].Len())
-			wg.Add(1)
-			go func(wg *sync.WaitGroup, r *record) {
-				defer wg.Done()
-
-				vName := fmt.Sprintf("%s.avi", time.Now().Format("2006_01_02_15_04_05"))
-
-				writer, err := gocv.VideoWriterFile(vName, "DIVX", float64(fps), img.Cols(), img.Rows(), true)
-				if err != nil {
-					fmt.Println("error opening video writer device")
-					return
-				}
-				//defer writer.Close()
-
-				for r.Len() > 0 {
-					e := r.PopFront()
-					if frame, ok := e.(gocv.Mat); ok {
-						if err := writer.Write(frame); err != nil {
-							fmt.Println(err)
-						}
-						time.Sleep(time.Duration(1000/fps) * time.Millisecond)
-					} else {
-						fmt.Println("Fail Mat")
-					}
-				}
-				writer.Close()
-				pushFile("credentials.json", vName)
-			}(&wg, &recordManager[j])
-
-			j++
-			j = j % 3
-
-		} else if postAlarm {
-			postAlarmCnt++
-		}
-
-		recordManager[j].PushBack(img)
-		if !postAlarm && time.Now().Sub(lastTime).Seconds() > 10*time.Second.Seconds() && cropImg {
-			fmt.Println(time.Now().Format("2006-01-02-15-04-05"))
-			postAlarm = true
-		}
 		if OPENWINDOW {
 			window.IMShow(img)
 			if window.WaitKey(1) >= 0 {
