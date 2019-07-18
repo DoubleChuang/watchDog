@@ -33,11 +33,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"image"
-	"image/color"
 	"io/ioutil"
 	"log"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"sync"
 	"time"
@@ -196,34 +196,34 @@ type record struct {
 }
 
 func (r *record) Len() int {
-	r.lock.Lock()
+	//r.lock.Lock()
 	l := r.frame.Len()
-	r.lock.Unlock()
+	//r.lock.Unlock()
 	return l
 }
 func (r *record) PopFront() interface{} {
-	r.lock.Lock()
+	//r.lock.Lock()
 	e := r.frame.Remove(r.frame.Front())
-	r.lock.Unlock()
+	//r.lock.Unlock()
 	return e
 }
 
-func (r *record) Front() interface{} {
-	r.lock.Lock()
+func (r *record) Front() *list.Element {
+	//r.lock.Lock()
 	e := r.frame.Front()
-	r.lock.Unlock()
+	//r.lock.Unlock()
 	return e
 }
 func (r *record) PushBack(v interface{}) *list.Element {
-	r.lock.Lock()
+	//r.lock.Lock()
 	e := r.frame.PushBack(v)
-	r.lock.Unlock()
+	//r.lock.Unlock()
 	return e
 }
 func (r *record) PushFront(v interface{}) *list.Element {
-	r.lock.Lock()
+	//r.lock.Lock()
 	e := r.frame.PushFront(v)
-	r.lock.Unlock()
+	//r.lock.Unlock()
 	return e
 }
 func checkListFrameTime(r *record, getFrame chan bool) {
@@ -232,10 +232,13 @@ func checkListFrameTime(r *record, getFrame chan bool) {
 		select {
 		//有新的影像儲存時 檢查Buffer頭一張是否超過時間
 		case <-getFrame:
-			if frame, ok := r.Front().(frameInfo); ok {
+			if frame, ok := r.Front().Value.(*frameInfo); ok {
 				if time.Now().Sub(frame.frameTime) > 10*time.Second {
 					r.PopFront()
+					//Dbgln("Pop frame", frame.frameTime)
 				}
+			} else {
+				Dbgln("No Frame")
 			}
 
 		}
@@ -247,9 +250,12 @@ func frameDetecter(net *gocv.Net, scaleFactor float64, size image.Point, mean go
 	for {
 		select {
 		case e := <-needDetect:
-			frame := e.Value.(frameInfo)
+			//Dbg("%p\n", e)
+
+			frame := e.Value.(*frameInfo)
+			//	Dbg("%p\n", e)
 			// convert image Mat to 300x300 blob that the object detector can analyze
-			blob := gocv.BlobFromImage(frame.mat, scaleFactor, image.Pt(300, 300), mean, swapRB, false)
+			blob := gocv.BlobFromImage(frame.mat, scaleFactor, image.Pt(300, 300), mean, swapRB, crop)
 
 			// feed the blob into the detector
 			net.SetInput(blob, "")
@@ -263,6 +269,7 @@ func frameDetecter(net *gocv.Net, scaleFactor float64, size image.Point, mean go
 
 			prob.Close()
 			blob.Close()
+
 		}
 	}
 }
@@ -272,28 +279,30 @@ var fps = 30
 func sendVideo(r *list.List, t time.Time) {
 	//defer wg.Done()
 	fileName := fmt.Sprintf("%s.avi", t.Format("2006_01_02_15_04_05"))
-	img := r.Front().Value.(frameInfo).mat
+	img := r.Front().Value.(*frameInfo).mat
 	writer, err := gocv.VideoWriterFile(fileName, "DIVX", float64(fps), img.Cols(), img.Rows(), true)
 	if err != nil {
 		fmt.Println("error opening video writer device")
 		return
 	}
-	defer os.Remove(fileName)
+	//defer os.Remove(fileName)
+	defer pushFile("credentials.json", fileName)
+	defer writer.Close()
 	//defer writer.Close()
 
-	for r.Len() > 0 {
+	for r.Front() != nil {
 		e := r.Remove(r.Front())
-		if frame, ok := e.(frameInfo); ok {
+		if frame, ok := e.(*frameInfo); ok {
 			if err := writer.Write(frame.mat); err != nil {
 				fmt.Println(err)
 			}
-			//time.Sleep(time.Duration(1000/fps) * time.Millisecond)
+			Dbgln(frame.frameTime.Format("2006_01_02_15_04_05"))
+			time.Sleep(time.Duration(1000/fps) * time.Millisecond)
 		} else {
 			fmt.Println("Fail Mat")
 		}
 	}
-	writer.Close()
-	pushFile("credentials.json", fileName)
+
 }
 
 func sendJpeg(img gocv.Mat, t time.Time) {
@@ -309,33 +318,49 @@ func sendJpeg(img gocv.Mat, t time.Time) {
 
 }
 func uploadMedia(alarmChan chan *list.Element) {
-	var lastUploadTime time.Time
+	var lastUploadTime = time.Now()
 	for {
 		select {
 		case e := <-alarmChan:
 			if time.Now().Sub(lastUploadTime) >= 10*time.Second {
 				frameBuf := list.New()
-				alarmTime := e.Value.(frameInfo).frameTime
+				alarmTime := e.Value.(*frameInfo).frameTime
 
-				go sendJpeg(e.Value.(frameInfo).mat, alarmTime)
+				go sendJpeg(e.Value.(*frameInfo).mat, alarmTime)
 
 				e_bk := e
+				pre_i := 0
+				post_i := 0
 				for ; e != nil; e = e.Prev() {
-					frame := e.Value.(frameInfo)
-					if alarmTime.Sub(frame.frameTime) < 5*time.Second {
-						frameBuf.PushFront(frame)
-					} else {
-						break
+					if frame, ok := e.Value.(*frameInfo); ok {
+						if alarmTime.Sub(frame.frameTime) < 5*time.Second {
+							//Dbgln(frame.frameTime.Format("2006_01_02_15_04_05"), alarmTime.Format("2006_01_02_15_04_05"))
+							frameBuf.PushFront(frame)
+							pre_i++
+						} else {
+							break
+						}
 					}
 				}
-				for e := e_bk.Next(); e != nil; e = e.Next() {
-					frame := e.Value.(frameInfo)
-					if frame.frameTime.Sub(alarmTime) < 5*time.Second {
-						frameBuf.PushBack(frame)
-					} else {
-						break
+
+				for eN := e_bk.Next(); eN != nil; eN = eN.Next() {
+					if frame, ok := eN.Value.(*frameInfo); ok {
+						if frame.frameTime.Sub(alarmTime) < 5*time.Second {
+							//Dbgln(frame.frameTime.Format("2006_01_02_15_04_05"), alarmTime.Format("2006_01_02_15_04_05"))
+							frameBuf.PushBack(frame)
+							post_i++
+							for eN.Next() == nil {
+								//Dbgln("Wait Frame")
+								time.Sleep(time.Duration(1000) * time.Millisecond)
+							}
+
+						} else {
+							break
+						}
 					}
+
 				}
+				Dbgln(pre_i, post_i)
 				go sendVideo(frameBuf, alarmTime)
 				lastUploadTime = time.Now()
 			}
@@ -352,6 +377,23 @@ func isOpenWindow(val string) bool {
 	}
 	return false
 }
+func Dbgln(args ...interface{}) {
+	programCounter, _, line, _ := runtime.Caller(1)
+	fn := runtime.FuncForPC(programCounter)
+	//prefix := fmt.Sprintf("[%s:%s %d] %s", file, fn.Name(), line, fmt_)
+	prefix := fmt.Sprintf("[%s %d]", fn.Name(), line)
+
+	fmt.Printf("%s", prefix)
+	fmt.Println(args...)
+}
+func Dbg(fmt_ string, args ...interface{}) {
+	programCounter, _, line, _ := runtime.Caller(1)
+	fn := runtime.FuncForPC(programCounter)
+	//prefix := fmt.Sprintf("[%s:%s %d] %s", file, fn.Name(), line, fmt_)
+	prefix := fmt.Sprintf("[%s %d] %s", fn.Name(), line, fmt_)
+	fmt.Printf(prefix, args...)
+	fmt.Println()
+}
 func main() {
 	if len(os.Args) < 4 {
 		fmt.Println("How to run:\ndnn-detection [videosource] [modelfile] [configfile] [show window]([backend] [device])")
@@ -364,9 +406,9 @@ func main() {
 	config := os.Args[3]
 	OPENWINDOW := isOpenWindow(os.Args[4])
 	backend := gocv.NetBackendDefault
-	alarmChan := make(chan *list.Element, 10*fps)
-	getFrameChan := make(chan bool, 20*fps)
-	needDetectChan := make(chan *list.Element, 30*fps)
+	alarmChan := make(chan *list.Element, 90*fps)
+	getFrameChan := make(chan bool, 90*fps)
+	needDetectChan := make(chan *list.Element, 90*fps)
 
 	if len(os.Args) > 5 {
 		backend = gocv.ParseNetBackend(os.Args[4])
@@ -433,18 +475,27 @@ func main() {
 	go checkListFrameTime(&recordManager[0], getFrameChan)
 	go frameDetecter(&net, ratio, image.Pt(300, 300), mean, swapRGB, false, needDetectChan, alarmChan)
 	go uploadMedia(alarmChan)
+	var cnt uint
+	var t time.Time
 	for {
+
 		if ok := webcam.Read(&img); !ok {
 			fmt.Printf("Device closed: %v\n", deviceID)
 			return
+		} else {
+			t = time.Now()
 		}
 		if img.Empty() {
 			continue
 		}
 
-		e := recordManager[0].PushBack(frameInfo{img, time.Now()})
+		e := recordManager[0].PushBack(&frameInfo{img, t})
 		getFrameChan <- true
-		needDetectChan <- e
+		//Dbg("0 %p\n", e)
+		if cnt%10 == 0 {
+			needDetectChan <- e
+		}
+		cnt++
 		//buf, _ := gocv.IMEncode(".jpg", img)
 		//stream.UpdateJPEG(buf)
 
@@ -467,12 +518,13 @@ func performDetection(frame *gocv.Mat, results gocv.Mat) (get bool) {
 	for i := 0; i < results.Total(); i += 7 {
 		confidence := results.GetFloatAt(0, i+2)
 		if confidence > 0.5 {
-			left := int(results.GetFloatAt(0, i+3) * float32(frame.Cols()))
-			top := int(results.GetFloatAt(0, i+4) * float32(frame.Rows()))
-			right := int(results.GetFloatAt(0, i+5) * float32(frame.Cols()))
-			bottom := int(results.GetFloatAt(0, i+6) * float32(frame.Rows()))
-			gocv.Rectangle(frame, image.Rect(left, top, right, bottom), color.RGBA{0, 255, 0, 0}, 2)
+			//left := int(results.GetFloatAt(0, i+3) * float32(frame.Cols()))
+			//top := int(results.GetFloatAt(0, i+4) * float32(frame.Rows()))
+			//right := int(results.GetFloatAt(0, i+5) * float32(frame.Cols()))
+			//bottom := int(results.GetFloatAt(0, i+6) * float32(frame.Rows()))
+			//gocv.Rectangle(frame, image.Rect(left, top, right, bottom), color.RGBA{0, 255, 0, 0}, 2)
 			get = true
+			break
 		}
 	}
 	return
