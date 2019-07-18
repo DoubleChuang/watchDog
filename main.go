@@ -169,7 +169,7 @@ func pushFile(jsonFile, fileName string) {
 	if err != nil {
 		log.Fatalf("Error: %v", err)
 	}
-	fmt.Printf("%s, https://drive.google.com/open?id=%s, %s\n", res.Name, res.Id, res.MimeType)
+	fmt.Printf("%s https://drive.google.com/open?id=%s %s\n", res.Name, res.Id, res.MimeType)
 
 	permissiondata := &drive.Permission{
 		Type: "anyone",
@@ -177,11 +177,11 @@ func pushFile(jsonFile, fileName string) {
 		//Domain:             "ebay.com",
 		AllowFileDiscovery: true,
 	}
-	pres, err := srv.Permissions.Create(res.Id, permissiondata).Do()
+	/*pres*/ _, err = srv.Permissions.Create(res.Id, permissiondata).Do()
 	if err != nil {
 		log.Fatalf("Error: %v", err)
 	}
-	fmt.Printf("%s, %s\n", pres.Type, pres.Role)
+	//fmt.Printf("%s, %s\n", pres.Type, pres.Role)
 
 }
 
@@ -233,9 +233,9 @@ func checkListFrameTime(r *record, getFrame chan bool) {
 		//有新的影像儲存時 檢查Buffer頭一張是否超過時間
 		case <-getFrame:
 			if frame, ok := r.Front().Value.(*frameInfo); ok {
-				if time.Now().Sub(frame.frameTime) > 10*time.Second {
+				if time.Now().Sub(frame.frameTime) > 15*time.Second {
 					r.PopFront()
-					//Dbgln("Pop frame", frame.frameTime)
+					frame.mat.Close()
 				}
 			} else {
 				Dbgln("No Frame")
@@ -250,10 +250,8 @@ func frameDetecter(net *gocv.Net, scaleFactor float64, size image.Point, mean go
 	for {
 		select {
 		case e := <-needDetect:
-			//Dbg("%p\n", e)
 
 			frame := e.Value.(*frameInfo)
-			//	Dbg("%p\n", e)
 			// convert image Mat to 300x300 blob that the object detector can analyze
 			blob := gocv.BlobFromImage(frame.mat, scaleFactor, image.Pt(300, 300), mean, swapRB, crop)
 
@@ -266,7 +264,6 @@ func frameDetecter(net *gocv.Net, scaleFactor float64, size image.Point, mean go
 			if performDetection(&frame.mat, prob) {
 				alarmChan <- e
 			}
-
 			prob.Close()
 			blob.Close()
 
@@ -285,21 +282,19 @@ func sendVideo(r *list.List, t time.Time) {
 		fmt.Println("error opening video writer device")
 		return
 	}
-	//defer os.Remove(fileName)
+	defer os.Remove(fileName)
 	defer pushFile("credentials.json", fileName)
 	defer writer.Close()
 	//defer writer.Close()
-
+	prev_time := r.Front().Value.(*frameInfo).frameTime
 	for r.Front() != nil {
 		e := r.Remove(r.Front())
 		if frame, ok := e.(*frameInfo); ok {
 			if err := writer.Write(frame.mat); err != nil {
 				fmt.Println(err)
 			}
-			Dbgln(frame.frameTime.Format("2006_01_02_15_04_05"))
-			time.Sleep(time.Duration(1000/fps) * time.Millisecond)
-		} else {
-			fmt.Println("Fail Mat")
+			time.Sleep(frame.frameTime.Sub(prev_time))
+			prev_time = frame.frameTime
 		}
 	}
 
@@ -328,39 +323,31 @@ func uploadMedia(alarmChan chan *list.Element) {
 
 				go sendJpeg(e.Value.(*frameInfo).mat, alarmTime)
 
-				e_bk := e
-				pre_i := 0
-				post_i := 0
-				for ; e != nil; e = e.Prev() {
-					if frame, ok := e.Value.(*frameInfo); ok {
+				for eN := e; eN != nil; eN = eN.Prev() {
+					if frame, ok := eN.Value.(*frameInfo); ok {
 						if alarmTime.Sub(frame.frameTime) < 5*time.Second {
 							//Dbgln(frame.frameTime.Format("2006_01_02_15_04_05"), alarmTime.Format("2006_01_02_15_04_05"))
 							frameBuf.PushFront(frame)
-							pre_i++
 						} else {
 							break
 						}
 					}
 				}
 
-				for eN := e_bk.Next(); eN != nil; eN = eN.Next() {
+				for eN := e.Next(); eN != nil; eN = eN.Next() {
 					if frame, ok := eN.Value.(*frameInfo); ok {
 						if frame.frameTime.Sub(alarmTime) < 5*time.Second {
 							//Dbgln(frame.frameTime.Format("2006_01_02_15_04_05"), alarmTime.Format("2006_01_02_15_04_05"))
 							frameBuf.PushBack(frame)
-							post_i++
 							for eN.Next() == nil {
-								//Dbgln("Wait Frame")
 								time.Sleep(time.Duration(1000) * time.Millisecond)
 							}
-
 						} else {
 							break
 						}
 					}
 
 				}
-				Dbgln(pre_i, post_i)
 				go sendVideo(frameBuf, alarmTime)
 				lastUploadTime = time.Now()
 			}
@@ -452,10 +439,9 @@ func main() {
 
 	//wg := sync.WaitGroup{}
 
-	var recordManager [3]record
-	for i, _ := range recordManager {
-		recordManager[i].frame = list.New()
-	}
+	var recordManager record
+
+	recordManager.frame = list.New()
 
 	if filepath.Ext(model) == ".caffemodel" {
 		ratio = 1.0
@@ -472,7 +458,7 @@ func main() {
 		http.Handle("/", stream)
 		log.Fatal(http.ListenAndServe("0.0.0.0:8080", nil))
 	}()*/
-	go checkListFrameTime(&recordManager[0], getFrameChan)
+	go checkListFrameTime(&recordManager, getFrameChan)
 	go frameDetecter(&net, ratio, image.Pt(300, 300), mean, swapRGB, false, needDetectChan, alarmChan)
 	go uploadMedia(alarmChan)
 	var cnt uint
@@ -489,7 +475,7 @@ func main() {
 			continue
 		}
 
-		e := recordManager[0].PushBack(&frameInfo{img, t})
+		e := recordManager.PushBack(&frameInfo{img.Clone(), t})
 		getFrameChan <- true
 		//Dbg("0 %p\n", e)
 		if cnt%10 == 0 {
