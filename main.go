@@ -1,30 +1,9 @@
-// What it does:
-//
-// This example uses a deep neural network to perform object detection.
-// It can be used with either the Caffe face tracking or Tensorflow object detection models that are
-// included with OpenCV 3.4
-//
-// To perform face tracking with the Caffe model:
-//
-// Download the model file from:
-// https://github.com/opencv/opencv_3rdparty/raw/dnn_samples_face_detector_20170830/res10_300x300_ssd_iter_140000.caffemodel
-//
-// You will also need the prototxt config file:
-// https://raw.githubusercontent.com/opencv/opencv/master/samples/dnn/face_detector/deploy.prototxt
-//
-// To perform object tracking with the Tensorflow model:
-//
-// Download and extract the model file named "frozen_inference_graph.pb" from:
-// http://download.tensorflow.org/models/object_detection/ssd_mobilenet_v1_coco_2017_11_17.tar.gz
-//
-// You will also need the pbtxt config file:
-// https://gist.githubusercontent.com/dkurt/45118a9c57c38677b65d6953ae62924a/raw/b0edd9e8c992c25fe1c804e77b06d20a89064871/ssd_mobilenet_v1_coco_2017_11_17.pbtxt
-//
 // How to run:
 //
-// 		go run ./cmd/dnn-detection/main.go [videosource] [modelfile] [configfile] ([backend] [device])
+// 		go run ./cmd/dnn-detection/main.go [videosource] [modelfile] [configfile] [show window] ([backend] [device])
+// TODO:
 //
-// +build example
+//		Check if the image exists
 
 package main
 
@@ -190,6 +169,10 @@ type frameInfo struct {
 	frameTime time.Time
 }
 
+func (f *frameInfo) Close() error {
+	return f.mat.Close()
+}
+
 type record struct {
 	lock  sync.Mutex
 	frame *list.List
@@ -233,7 +216,7 @@ func checkListFrameTime(r *record, getFrame chan bool) {
 		//有新的影像儲存時 檢查Buffer頭一張是否超過時間
 		case <-getFrame:
 			if frame, ok := r.Front().Value.(*frameInfo); ok {
-				if time.Now().Sub(frame.frameTime) > 15*time.Second {
+				if time.Now().Sub(frame.frameTime) > 7*time.Second {
 					r.PopFront()
 					frame.mat.Close()
 				}
@@ -244,9 +227,34 @@ func checkListFrameTime(r *record, getFrame chan bool) {
 		}
 	}
 }
-func frameDetecter(net *gocv.Net, scaleFactor float64, size image.Point, mean gocv.Scalar,
-	swapRB bool, crop bool, needDetect chan *list.Element, alarmChan chan *list.Element) {
+func checkListFrameTimeV2(r *record, c chan time.Time) {
 
+	for {
+		select {
+		//有新的影像儲存時 檢查Buffer頭一張是否超過時間
+		case t := <-c:
+			for {
+				if r.Front() != nil {
+					if frame, ok := r.Front().Value.(*frameInfo); ok {
+						if t.Sub(frame.frameTime) > time.Duration(20)*time.Second {
+							r.PopFront()
+							frame.mat.Close()
+						} else {
+							break
+						}
+					} else {
+						Dbgln("No Frame")
+					}
+				}
+			}
+		}
+	}
+}
+func frameDetecter(net *gocv.Net, scaleFactor float64, size image.Point, mean gocv.Scalar,
+	swapRB bool, crop bool, needDetect chan *list.Element, alarmChan chan *list.Element, getFrame chan time.Time) {
+	var lastUploadTime = time.Now()
+	killer := lastUploadTime
+	var i int
 	for {
 		select {
 		case e := <-needDetect:
@@ -262,7 +270,19 @@ func frameDetecter(net *gocv.Net, scaleFactor float64, size image.Point, mean go
 			prob := net.Forward("")
 
 			if performDetection(&frame.mat, prob) {
-				alarmChan <- e
+				if time.Now().Sub(lastUploadTime) >= 10*time.Second {
+					alarmChan <- e
+					lastUploadTime = time.Now()
+					killer = lastUploadTime
+					i = 0
+				}
+			} else {
+				if time.Now().Sub(lastUploadTime) >= 10*time.Second {
+					i++
+					killer = killer.Add(time.Duration(10*i-8) * time.Second)
+					getFrame <- killer
+
+				}
 			}
 			prob.Close()
 			blob.Close()
@@ -273,9 +293,10 @@ func frameDetecter(net *gocv.Net, scaleFactor float64, size image.Point, mean go
 
 var fps = 30
 
-func sendVideo(r *list.List, t time.Time) {
+func sendVideo(r *list.List, t time.Time, getFrame chan time.Time) {
 	//defer wg.Done()
 	fileName := fmt.Sprintf("%s.avi", t.Format("2006_01_02_15_04_05"))
+
 	img := r.Front().Value.(*frameInfo).mat
 	writer, err := gocv.VideoWriterFile(fileName, "DIVX", float64(fps), img.Cols(), img.Rows(), true)
 	if err != nil {
@@ -286,18 +307,18 @@ func sendVideo(r *list.List, t time.Time) {
 	defer pushFile("credentials.json", fileName)
 	defer writer.Close()
 	//defer writer.Close()
-	prev_time := r.Front().Value.(*frameInfo).frameTime
+	prevTime := r.Front().Value.(*frameInfo).frameTime
 	for r.Front() != nil {
 		e := r.Remove(r.Front())
 		if frame, ok := e.(*frameInfo); ok {
 			if err := writer.Write(frame.mat); err != nil {
 				fmt.Println(err)
 			}
-			time.Sleep(frame.frameTime.Sub(prev_time))
-			prev_time = frame.frameTime
+			time.Sleep(frame.frameTime.Sub(prevTime))
+			prevTime = frame.frameTime
 		}
 	}
-
+	getFrame <- t
 }
 
 func sendJpeg(img gocv.Mat, t time.Time) {
@@ -312,45 +333,44 @@ func sendJpeg(img gocv.Mat, t time.Time) {
 	}
 
 }
-func uploadMedia(alarmChan chan *list.Element) {
-	var lastUploadTime = time.Now()
+func uploadMedia(r *record, alarmChan chan *list.Element, getFrame chan time.Time) {
+
 	for {
 		select {
 		case e := <-alarmChan:
-			if time.Now().Sub(lastUploadTime) >= 10*time.Second {
-				frameBuf := list.New()
-				alarmTime := e.Value.(*frameInfo).frameTime
 
-				go sendJpeg(e.Value.(*frameInfo).mat, alarmTime)
+			frameBuf := list.New()
+			alarmTime := e.Value.(*frameInfo).frameTime
 
-				for eN := e; eN != nil; eN = eN.Prev() {
-					if frame, ok := eN.Value.(*frameInfo); ok {
-						if alarmTime.Sub(frame.frameTime) < 5*time.Second {
-							//Dbgln(frame.frameTime.Format("2006_01_02_15_04_05"), alarmTime.Format("2006_01_02_15_04_05"))
-							frameBuf.PushFront(frame)
-						} else {
-							break
-						}
+			go sendJpeg(e.Value.(*frameInfo).mat, alarmTime)
+
+			for eN := e; eN != nil; eN = eN.Prev() {
+				if frame, ok := eN.Value.(*frameInfo); ok {
+					if alarmTime.Sub(frame.frameTime) < 5*time.Second {
+						//Dbgln(frame.frameTime.Format("2006_01_02_15_04_05"), alarmTime.Format("2006_01_02_15_04_05"))
+						frameBuf.PushFront(frame)
+					} else {
+						break
 					}
 				}
-
-				for eN := e.Next(); eN != nil; eN = eN.Next() {
-					if frame, ok := eN.Value.(*frameInfo); ok {
-						if frame.frameTime.Sub(alarmTime) < 5*time.Second {
-							//Dbgln(frame.frameTime.Format("2006_01_02_15_04_05"), alarmTime.Format("2006_01_02_15_04_05"))
-							frameBuf.PushBack(frame)
-							for eN.Next() == nil {
-								time.Sleep(time.Duration(1000) * time.Millisecond)
-							}
-						} else {
-							break
-						}
-					}
-
-				}
-				go sendVideo(frameBuf, alarmTime)
-				lastUploadTime = time.Now()
 			}
+
+			for eN := e.Next(); eN != nil; eN = eN.Next() {
+				if frame, ok := eN.Value.(*frameInfo); ok {
+					if frame.frameTime.Sub(alarmTime) < 5*time.Second {
+						//Dbgln(frame.frameTime.Format("2006_01_02_15_04_05"), alarmTime.Format("2006_01_02_15_04_05"))
+						frameBuf.PushBack(frame)
+						for eN.Next() == nil {
+							time.Sleep(time.Duration(1000) * time.Millisecond)
+						}
+					} else {
+						break
+					}
+				}
+
+			}
+			go sendVideo(frameBuf, alarmTime, getFrame)
+
 		}
 	}
 }
@@ -364,6 +384,8 @@ func isOpenWindow(val string) bool {
 	}
 	return false
 }
+
+//Dbgln Dbgln
 func Dbgln(args ...interface{}) {
 	programCounter, _, line, _ := runtime.Caller(1)
 	fn := runtime.FuncForPC(programCounter)
@@ -373,11 +395,13 @@ func Dbgln(args ...interface{}) {
 	fmt.Printf("%s", prefix)
 	fmt.Println(args...)
 }
-func Dbg(fmt_ string, args ...interface{}) {
+
+//Dbg Dbg
+func Dbg(s string, args ...interface{}) {
 	programCounter, _, line, _ := runtime.Caller(1)
 	fn := runtime.FuncForPC(programCounter)
-	//prefix := fmt.Sprintf("[%s:%s %d] %s", file, fn.Name(), line, fmt_)
-	prefix := fmt.Sprintf("[%s %d] %s", fn.Name(), line, fmt_)
+	//prefix := fmt.Sprintf("[%s:%s %d] %s", file, fn.Name(), line, s)
+	prefix := fmt.Sprintf("[%s %d] %s", fn.Name(), line, s)
 	fmt.Printf(prefix, args...)
 	fmt.Println()
 }
@@ -394,7 +418,8 @@ func main() {
 	OPENWINDOW := isOpenWindow(os.Args[4])
 	backend := gocv.NetBackendDefault
 	alarmChan := make(chan *list.Element, 90*fps)
-	getFrameChan := make(chan bool, 90*fps)
+	//getFrameChan := make(chan bool, 90*fps)
+	getFrameV2 := make(chan time.Time, 90*fps)
 	needDetectChan := make(chan *list.Element, 90*fps)
 
 	if len(os.Args) > 5 {
@@ -458,9 +483,10 @@ func main() {
 		http.Handle("/", stream)
 		log.Fatal(http.ListenAndServe("0.0.0.0:8080", nil))
 	}()*/
-	go checkListFrameTime(&recordManager, getFrameChan)
-	go frameDetecter(&net, ratio, image.Pt(300, 300), mean, swapRGB, false, needDetectChan, alarmChan)
-	go uploadMedia(alarmChan)
+	//go checkListFrameTime(&recordManager, getFrameChan)
+	go checkListFrameTimeV2(&recordManager, getFrameV2)
+	go frameDetecter(&net, ratio, image.Pt(300, 300), mean, swapRGB, false, needDetectChan, alarmChan, getFrameV2)
+	go uploadMedia(&recordManager, alarmChan, getFrameV2)
 	var cnt uint
 	var t time.Time
 	for {
@@ -468,15 +494,15 @@ func main() {
 		if ok := webcam.Read(&img); !ok {
 			fmt.Printf("Device closed: %v\n", deviceID)
 			return
-		} else {
-			t = time.Now()
 		}
+		t = time.Now()
+
 		if img.Empty() {
 			continue
 		}
 
 		e := recordManager.PushBack(&frameInfo{img.Clone(), t})
-		getFrameChan <- true
+		//getFrameChan <- true
 		//Dbg("0 %p\n", e)
 		if cnt%10 == 0 {
 			needDetectChan <- e
