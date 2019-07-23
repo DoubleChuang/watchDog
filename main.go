@@ -233,7 +233,7 @@ func checkListFrameTime(r *record, getFrame chan bool) {
 		//有新的影像儲存時 檢查Buffer頭一張是否超過時間
 		case <-getFrame:
 			if frame, ok := r.Front().Value.(*frameInfo); ok {
-				if time.Now().Sub(frame.frameTime) > 15*time.Second {
+				if time.Now().Sub(frame.frameTime) > time.Duration(recSec*2)*time.Second {
 					r.PopFront()
 					frame.mat.Close()
 				}
@@ -271,7 +271,10 @@ func frameDetecter(net *gocv.Net, scaleFactor float64, size image.Point, mean go
 	}
 }
 
-var fps = 30
+var (
+	fps    = 30
+	recSec = 3
+)
 
 func sendVideo(r *list.List, t time.Time) {
 	//defer wg.Done()
@@ -317,7 +320,7 @@ func uploadMedia(alarmChan chan *list.Element) {
 	for {
 		select {
 		case e := <-alarmChan:
-			if time.Now().Sub(lastUploadTime) >= 10*time.Second {
+			if time.Now().Sub(lastUploadTime) >= time.Duration(2*recSec)*time.Second {
 				frameBuf := list.New()
 				alarmTime := e.Value.(*frameInfo).frameTime
 
@@ -325,7 +328,7 @@ func uploadMedia(alarmChan chan *list.Element) {
 
 				for eN := e; eN != nil; eN = eN.Prev() {
 					if frame, ok := eN.Value.(*frameInfo); ok {
-						if alarmTime.Sub(frame.frameTime) < 5*time.Second {
+						if alarmTime.Sub(frame.frameTime) < time.Duration(recSec)*time.Second {
 							//Dbgln(frame.frameTime.Format("2006_01_02_15_04_05"), alarmTime.Format("2006_01_02_15_04_05"))
 							frameBuf.PushFront(frame)
 						} else {
@@ -336,7 +339,7 @@ func uploadMedia(alarmChan chan *list.Element) {
 
 				for eN := e.Next(); eN != nil; eN = eN.Next() {
 					if frame, ok := eN.Value.(*frameInfo); ok {
-						if frame.frameTime.Sub(alarmTime) < 5*time.Second {
+						if frame.frameTime.Sub(alarmTime) < time.Duration(recSec)*time.Second {
 							//Dbgln(frame.frameTime.Format("2006_01_02_15_04_05"), alarmTime.Format("2006_01_02_15_04_05"))
 							frameBuf.PushBack(frame)
 							for eN.Next() == nil {
@@ -383,7 +386,7 @@ func Dbg(fmt_ string, args ...interface{}) {
 }
 func main() {
 	if len(os.Args) < 4 {
-		fmt.Println("How to run:\ndnn-detection [videosource] [modelfile] [configfile] [show window]([backend] [device])")
+		fmt.Println("How to run:\ndnn-detection [videosource] [modelfile] [configfile] [show window] [fps] [recSec] ([backend] [device])")
 		return
 	}
 
@@ -392,18 +395,35 @@ func main() {
 	model := os.Args[2]
 	config := os.Args[3]
 	OPENWINDOW := isOpenWindow(os.Args[4])
+	if len(os.Args) > 5 {
+		var err error
+		fps, err = strconv.Atoi(os.Args[5])
+		if err != nil || fps > 60 || fps < 1 {
+			fmt.Printf("Error input fps: %v\n", fps)
+			return
+		}
+	}
+	if len(os.Args) > 6 {
+		var err error
+		recSec, err = strconv.Atoi(os.Args[6])
+		if err != nil || recSec > 5 || recSec < 1 {
+			fmt.Printf("Error input record second: %v\n", recSec)
+			return
+		}
+	}
+
 	backend := gocv.NetBackendDefault
 	alarmChan := make(chan *list.Element, 90*fps)
 	getFrameChan := make(chan bool, 90*fps)
 	needDetectChan := make(chan *list.Element, 90*fps)
 
-	if len(os.Args) > 5 {
-		backend = gocv.ParseNetBackend(os.Args[4])
+	if len(os.Args) > 7 {
+		backend = gocv.ParseNetBackend(os.Args[7])
 	}
 
 	target := gocv.NetTargetCPU
-	if len(os.Args) > 6 {
-		target = gocv.ParseNetTarget(os.Args[5])
+	if len(os.Args) > 7 {
+		target = gocv.ParseNetTarget(os.Args[8])
 	}
 
 	// open capture device
@@ -468,9 +488,9 @@ func main() {
 		if ok := webcam.Read(&img); !ok {
 			fmt.Printf("Device closed: %v\n", deviceID)
 			return
-		} else {
-			t = time.Now()
 		}
+		t = time.Now()
+
 		if img.Empty() {
 			continue
 		}
@@ -490,6 +510,9 @@ func main() {
 			if window.WaitKey(1) >= 0 {
 				break
 			}
+		}
+		if ns := t.Add(time.Duration(1000000/fps) * time.Nanosecond).Sub(time.Now()); ns > 0 {
+			time.Sleep(ns)
 		}
 	}
 }
