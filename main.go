@@ -1,31 +1,3 @@
-// What it does:
-//
-// This example uses a deep neural network to perform object detection.
-// It can be used with either the Caffe face tracking or Tensorflow object detection models that are
-// included with OpenCV 3.4
-//
-// To perform face tracking with the Caffe model:
-//
-// Download the model file from:
-// https://github.com/opencv/opencv_3rdparty/raw/dnn_samples_face_detector_20170830/res10_300x300_ssd_iter_140000.caffemodel
-//
-// You will also need the prototxt config file:
-// https://raw.githubusercontent.com/opencv/opencv/master/samples/dnn/face_detector/deploy.prototxt
-//
-// To perform object tracking with the Tensorflow model:
-//
-// Download and extract the model file named "frozen_inference_graph.pb" from:
-// http://download.tensorflow.org/models/object_detection/ssd_mobilenet_v1_coco_2017_11_17.tar.gz
-//
-// You will also need the pbtxt config file:
-// https://gist.githubusercontent.com/dkurt/45118a9c57c38677b65d6953ae62924a/raw/b0edd9e8c992c25fe1c804e77b06d20a89064871/ssd_mobilenet_v1_coco_2017_11_17.pbtxt
-//
-// How to run:
-//
-// 		go run ./cmd/dnn-detection/main.go [videosource] [modelfile] [configfile] ([backend] [device])
-//
-// +build example
-
 package main
 
 import (
@@ -54,7 +26,56 @@ import (
 	"golang.org/x/oauth2/google"
 	"google.golang.org/api/drive/v3"
 	"google.golang.org/api/googleapi"
+	"gopkg.in/gomail.v2"
 )
+
+var (
+	fps           = 30
+	recSec        = 3
+	recordManager record
+)
+
+type JsonConfig struct {
+	User string `json:"user"`
+	Pswd string `json:"pswd"`
+}
+
+func ReadFile2Buf(filePath string) []byte {
+	file, err := os.Open(filePath)
+	if err != nil {
+		panic(err)
+	}
+	defer file.Close()
+	b, err := ioutil.ReadAll(file)
+	return b
+}
+func NewMailDialer(jsonPath string) *gomail.Dialer {
+	byt := ReadFile2Buf(jsonPath)
+	var res JsonConfig
+	err := json.Unmarshal([]byte(byt), &res)
+	if err != nil {
+		panic(err)
+	}
+	//fmt.Println(res)
+	dialer := gomail.NewDialer("smtp.office365.com", 587, res.User, res.Pswd)
+	return dialer
+}
+
+func SendMail(subject string, path string) {
+	fmt.Println("正在傳送 " + subject + "...")
+	msg := gomail.NewMessage()
+
+	msg.SetHeader("From", "never__night@hotmail.com")
+	msg.SetHeader("To", "ethan9141@gmail.com")
+	msg.SetHeader("Subject", subject)
+	msg.SetBody("text/html", path)
+
+	mail := NewMailDialer("./mail.json")
+
+	if err := mail.DialAndSend(msg); err != nil {
+		panic(err)
+	}
+}
 
 // Retrieves a token from a local file.
 func tokenFromFile(file string) (*oauth2.Token, error) {
@@ -129,7 +150,7 @@ func GetFileContentType(out *os.File) (string, error) {
 
 	return contentType, nil
 }
-func pushFile(jsonFile, fileName string) {
+func pushFile(jsonFile, fileName string) string {
 	b, err := ioutil.ReadFile(jsonFile)
 	if err != nil {
 		log.Fatalf("Unable to read client secret file: %v", err)
@@ -169,6 +190,7 @@ func pushFile(jsonFile, fileName string) {
 	if err != nil {
 		log.Fatalf("Error: %v", err)
 	}
+	fmt.Sprintf("")
 	fmt.Printf("%s https://drive.google.com/open?id=%s %s\n", res.Name, res.Id, res.MimeType)
 
 	permissiondata := &drive.Permission{
@@ -182,7 +204,7 @@ func pushFile(jsonFile, fileName string) {
 		log.Fatalf("Error: %v", err)
 	}
 	//fmt.Printf("%s, %s\n", pres.Type, pres.Role)
-
+	return "https://drive.google.com/open?id=" + res.Id
 }
 
 type frameInfo struct {
@@ -233,7 +255,7 @@ func checkListFrameTime(r *record, getFrame chan bool) {
 		//有新的影像儲存時 檢查Buffer頭一張是否超過時間
 		case <-getFrame:
 			if frame, ok := r.Front().Value.(*frameInfo); ok {
-				if time.Now().Sub(frame.frameTime) > time.Duration(recSec*2)*time.Second {
+				if time.Since(frame.frameTime) > time.Duration(recSec*3)*time.Second {
 					r.PopFront()
 					frame.mat.Close()
 				}
@@ -271,12 +293,7 @@ func frameDetecter(net *gocv.Net, scaleFactor float64, size image.Point, mean go
 	}
 }
 
-var (
-	fps    = 30
-	recSec = 3
-)
-
-func sendVideo(r *list.List, t time.Time) {
+func sendVideo(r *list.List, t time.Time, url chan string) {
 	//defer wg.Done()
 	fileName := fmt.Sprintf("%s.avi", t.Format("2006_01_02_15_04_05"))
 	img := r.Front().Value.(*frameInfo).mat
@@ -286,8 +303,7 @@ func sendVideo(r *list.List, t time.Time) {
 		return
 	}
 	defer os.Remove(fileName)
-	defer pushFile("credentials.json", fileName)
-	defer writer.Close()
+
 	//defer writer.Close()
 	prev_time := r.Front().Value.(*frameInfo).frameTime
 	for r.Front() != nil {
@@ -300,58 +316,73 @@ func sendVideo(r *list.List, t time.Time) {
 			prev_time = frame.frameTime
 		}
 	}
-
+	writer.Close()
+	url <- pushFile("credentials.json", fileName)
 }
 
-func sendJpeg(img gocv.Mat, t time.Time) {
+func sendJpeg(img gocv.Mat, t time.Time, url chan string) {
 
 	fileName := fmt.Sprintf("%s.jpg", t.Format("2006_01_02_15_04_05"))
 
 	if gocv.IMWrite(fileName, img) {
 		defer os.Remove(fileName)
-		pushFile("credentials.json", fileName)
+		url <- pushFile("credentials.json", fileName)
 	} else {
 		fmt.Println("IMWrite Fail")
 	}
-
 }
+func generateBody(imgURL, videoURL string) string {
+
+	return fmt.Sprintf("<a href=\"%s\" target=\"_blank\" >image</a><br><a href=\"%s\" target=\"_blank\">video</a><br>", imgURL, videoURL)
+}
+
+func uploadAll(e *list.Element, alarmChan chan *list.Element) {
+	frameBuf := list.New()
+	alarmTime := e.Value.(*frameInfo).frameTime
+	imgURL := make(chan string)
+	videoURL := make(chan string)
+
+	go sendJpeg(e.Value.(*frameInfo).mat, alarmTime, imgURL)
+
+	for eN := e; eN != nil; eN = eN.Prev() {
+		if frame, ok := eN.Value.(*frameInfo); ok {
+			if alarmTime.Sub(frame.frameTime) < time.Duration(recSec)*time.Second {
+				//Dbgln(frame.frameTime.Format("2006_01_02_15_04_05"), alarmTime.Format("2006_01_02_15_04_05"))
+				frameBuf.PushFront(frame)
+			} else {
+				break
+			}
+		}
+	}
+
+	for eN := e; /*e.Next()*/ eN != nil; eN = eN.Next() {
+		if frame, ok := eN.Value.(*frameInfo); ok {
+			if frame.frameTime.Sub(alarmTime) < time.Duration(recSec)*time.Second {
+				//Dbgln(frame.frameTime.Format("2006_01_02_15_04_05"), alarmTime.Format("2006_01_02_15_04_05"))
+				frameBuf.PushBack(frame)
+				for eN.Next() == nil {
+					time.Sleep(time.Duration(1000) * time.Millisecond)
+				}
+			} else {
+				break
+			}
+		}
+
+	}
+	go sendVideo(frameBuf, alarmTime, videoURL)
+	jpeg := <-imgURL
+	video := <-videoURL
+
+	SendMail("[Alarm]"+alarmTime.Format("2006/01/02 15:04:05"), generateBody(jpeg, video))
+}
+
 func uploadMedia(alarmChan chan *list.Element) {
 	var lastUploadTime = time.Now()
 	for {
 		select {
 		case e := <-alarmChan:
-			if time.Now().Sub(lastUploadTime) >= time.Duration(2*recSec)*time.Second {
-				frameBuf := list.New()
-				alarmTime := e.Value.(*frameInfo).frameTime
-
-				go sendJpeg(e.Value.(*frameInfo).mat, alarmTime)
-
-				for eN := e; eN != nil; eN = eN.Prev() {
-					if frame, ok := eN.Value.(*frameInfo); ok {
-						if alarmTime.Sub(frame.frameTime) < time.Duration(recSec)*time.Second {
-							//Dbgln(frame.frameTime.Format("2006_01_02_15_04_05"), alarmTime.Format("2006_01_02_15_04_05"))
-							frameBuf.PushFront(frame)
-						} else {
-							break
-						}
-					}
-				}
-
-				for eN := e.Next(); eN != nil; eN = eN.Next() {
-					if frame, ok := eN.Value.(*frameInfo); ok {
-						if frame.frameTime.Sub(alarmTime) < time.Duration(recSec)*time.Second {
-							//Dbgln(frame.frameTime.Format("2006_01_02_15_04_05"), alarmTime.Format("2006_01_02_15_04_05"))
-							frameBuf.PushBack(frame)
-							for eN.Next() == nil {
-								time.Sleep(time.Duration(1000) * time.Millisecond)
-							}
-						} else {
-							break
-						}
-					}
-
-				}
-				go sendVideo(frameBuf, alarmTime)
+			if time.Since(lastUploadTime) > time.Duration(recSec*2)*time.Second {
+				go uploadAll(e, alarmChan)
 				lastUploadTime = time.Now()
 			}
 		}
@@ -384,6 +415,7 @@ func Dbg(fmt_ string, args ...interface{}) {
 	fmt.Printf(prefix, args...)
 	fmt.Println()
 }
+
 func main() {
 	if len(os.Args) < 4 {
 		fmt.Println("How to run:\ndnn-detection [videosource] [modelfile] [configfile] [show window] [fps] [recSec] ([backend] [device])")
@@ -458,8 +490,6 @@ func main() {
 	var swapRGB bool
 
 	//wg := sync.WaitGroup{}
-
-	var recordManager record
 
 	recordManager.frame = list.New()
 
